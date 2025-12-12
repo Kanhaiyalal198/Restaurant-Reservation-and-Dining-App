@@ -75,6 +75,22 @@ CREATE TABLE IF NOT EXISTS orders (
   FOREIGN KEY (booking_id) REFERENCES bookings(id)
 );
 
+-- Payments
+CREATE TABLE IF NOT EXISTS payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  order_id INTEGER,
+  booking_id INTEGER,
+  method TEXT NOT NULL, -- 'credit_card', 'debit_card', 'upi', 'wallet', 'netbanking', etc.
+  amount REAL NOT NULL,
+  status TEXT DEFAULT 'pending', -- 'pending', 'succeeded', 'failed'
+  tx_ref TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (order_id) REFERENCES orders(id),
+  FOREIGN KEY (booking_id) REFERENCES bookings(id)
+);
+
 -- Order items
 CREATE TABLE IF NOT EXISTS order_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -55,6 +55,21 @@ A full-featured restaurant reservation and dining application built with Hono fr
 - Secure payment processing
 - Payment history
 
+### ✅ Real-Time Notifications (Email/SMS/WhatsApp)
+- Instant order confirmation via Email (SendGrid)
+- SMS receipt delivery (Twilio)
+- WhatsApp order status updates
+- Automated receipt generation with order & booking details
+- Multi-channel notification dispatch
+- **[Setup Instructions: NOTIFICATIONS_SETUP.md](./NOTIFICATIONS_SETUP.md)**
+
+### ✅ Real-Time Updates
+- Bookings auto-refresh every 10 seconds on frontend
+- Live order status polling
+- Confirmed bookings show ordered items
+- Cancelled bookings hide items
+- Instant UI sync after payment
+
 ### ✅ Admin Features
 - Dashboard with statistics
   - Today's bookings count
@@ -323,3 +338,5 @@ MIT License - Feel free to use for your restaurant!
 ---
 
 **Built with ❤️ using Hono + Cloudflare Edge Platform**
+#   R e s t a u r a n t - R e s e r v a t i o n - a n d - D i n i n g - A p p  
+ 

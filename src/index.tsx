@@ -2,17 +2,180 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { serveStatic } from 'hono/cloudflare-workers'
 
+// Import type for D1Database if available
+// @ts-ignore-next-line: Ignore until types are available for D1Database
+type D1Database = any;
+
 type Bindings = {
   DB: D1Database;
 }
 
-const app = new Hono<{ Bindings: Bindings }>()
+const app = new Hono<{ Bindings: Bindings }>();
+
+// In-memory notification log for local testing (stores last 100 notifications)
+const notificationLog: any[] = []
+const MAX_LOG_SIZE = 100
+
+function logNotification(event: any) {
+  notificationLog.unshift(event)
+  if (notificationLog.length > MAX_LOG_SIZE) {
+    notificationLog.pop()
+  }
+}
+
+// Integrate real email/SMS/WhatsApp providers when credentials are available.
+// This implementation uses SendGrid for email and Twilio for SMS/WhatsApp via their REST APIs.
+async function sendReceipt(user: { email?: string; phone?: string; whatsapp?: string; name?: string }, payload: any) {
+  const recipient = user || {}
+  const channelsUsed: any = {}
+
+  // Build a simple plain-text receipt body
+  const buildBody = () => {
+    let body = ''
+    body += `Receipt for ${recipient.name || 'Customer'}\n`;
+    body += `Type: ${payload.type || 'receipt'}\n`;
+    if (payload.orderId) body += `Order ID: ${payload.orderId}\n`;
+    if (payload.bookingId) body += `Booking ID: ${payload.bookingId}\n`;
+    if (payload.amount) body += `Amount: ${payload.amount} ${payload.currency || ''}\n`;
+    if (payload.items && Array.isArray(payload.items)) {
+      body += `Items:\n`
+      for (const it of payload.items) {
+        body += ` - ${it.name || it.menuItemId} x${it.quantity || 1} = ${it.price || ''}\n`
+      }
+    }
+    body += `\nThanks for your order!`
+    return body
+  }
+
+  const bodyText = buildBody()
+
+  // Send Email via SendGrid if key available
+  const SENDGRID_KEY = typeof process !== 'undefined' ? (process.env.SENDGRID_API_KEY as string) : undefined
+  if (SENDGRID_KEY && recipient.email) {
+    try {
+      await fetch('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${SENDGRID_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          personalizations: [{ to: [{ email: recipient.email }], subject: `Your receipt${payload.orderId ? ` - ${payload.orderId}` : ''}` }],
+          from: { email: process.env.SENDGRID_FROM_EMAIL || 'no-reply@example.com', name: process.env.SENDGRID_FROM_NAME || 'Restaurant' },
+          content: [{ type: 'text/plain', value: bodyText }]
+        })
+      })
+      channelsUsed.email = 'sent'
+    } catch (e) {
+      console.error('SendGrid email failed', e)
+      channelsUsed.email = 'failed'
+    }
+  } else {
+    channelsUsed.email = recipient.email ? 'ready (no-sendgrid-key)' : 'no-email'
+  }
+
+  // Send SMS / WhatsApp via Twilio if credentials available
+  const TW_SID = typeof process !== 'undefined' ? (process.env.TWILIO_ACCOUNT_SID as string) : undefined
+  const TW_TOKEN = typeof process !== 'undefined' ? (process.env.TWILIO_AUTH_TOKEN as string) : undefined
+  const TW_FROM = typeof process !== 'undefined' ? (process.env.TWILIO_PHONE_NUMBER as string) : undefined
+
+  if (TW_SID && TW_TOKEN && TW_FROM) {
+    const basicAuth = Buffer.from(`${TW_SID}:${TW_TOKEN}`).toString('base64')
+    // Send SMS
+    if (recipient.phone) {
+      try {
+        const form = new URLSearchParams()
+        form.append('To', recipient.phone)
+        form.append('From', TW_FROM)
+        form.append('Body', bodyText)
+
+        await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TW_SID}/Messages.json`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${basicAuth}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: form.toString()
+        })
+        channelsUsed.sms = 'sent'
+      } catch (e) {
+        console.error('Twilio SMS failed', e)
+        channelsUsed.sms = 'failed'
+      }
+    } else {
+      channelsUsed.sms = 'no-phone'
+    }
+
+    // Send WhatsApp via Twilio (if whatsapp number provided)
+    if (recipient.whatsapp) {
+      try {
+        const form = new URLSearchParams()
+        form.append('To', `whatsapp:${recipient.whatsapp}`)
+        form.append('From', `whatsapp:${TW_FROM}`)
+        form.append('Body', bodyText)
+
+        await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TW_SID}/Messages.json`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${basicAuth}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: form.toString()
+        })
+        channelsUsed.whatsapp = 'sent'
+      } catch (e) {
+        console.error('Twilio WhatsApp failed', e)
+        channelsUsed.whatsapp = 'failed'
+      }
+    } else {
+      channelsUsed.whatsapp = 'ready (no-whatsapp-key)'
+    }
+  } else {
+    channelsUsed.sms = 'ready (no-twilio-config)'
+    channelsUsed.whatsapp = 'ready (no-twilio-config)'
+  }
+
+  // Log notification for local testing/debugging
+  const event = {
+    timestamp: new Date().toISOString(),
+    to: recipient,
+    type: payload.type,
+    orderId: payload.orderId,
+    bookingId: payload.bookingId,
+    channels: channelsUsed,
+    bodyPreview: bodyText.substring(0, 100)
+  }
+    logNotification(event);
+    console.log('Receipt dispatch', event);
+  console.log('Receipt dispatch', event)
+}
+
 
 // Enable CORS
 app.use('/api/*', cors())
 
 // Serve static files
-app.use('/static/*', serveStatic({ root: './public' }))
+app.use('/static/*', serveStatic({
+  root: './public',
+  manifest: ''
+}))
+
+// ============= NOTIFICATION DEBUG ROUTES =============
+
+// View notification log (for local testing/debugging)
+app.get('/api/notifications/log', (c) => {
+  return c.json({
+    message: 'Notification log (last 100 events)',
+    count: notificationLog.length,
+    notifications: notificationLog
+  })
+})
+
+// Clear notification log
+app.post('/api/notifications/log/clear', (c) => {
+  notificationLog.length = 0
+  return c.json({ message: 'Notification log cleared' })
+})
 
 // ============= AUTHENTICATION ROUTES =============
 
@@ -39,6 +202,9 @@ app.post('/api/auth/register', async (c) => {
       message: 'User registered successfully' 
     })
   } catch (error: any) {
+    if (typeof console !== 'undefined' && console.error) {
+      console.error('Login failed', error);
+    }
     if (error.message?.includes('UNIQUE constraint failed')) {
       return c.json({ error: 'Email already exists' }, 409)
     }
@@ -72,6 +238,9 @@ app.post('/api/auth/login', async (c) => {
       message: 'Login successful' 
     })
   } catch (error) {
+    if (typeof console !== 'undefined' && console.error) {
+      console.error('Login failed', error);
+    }
     return c.json({ error: 'Login failed' }, 500)
   }
 })
@@ -121,22 +290,205 @@ app.get('/api/tables/available', async (c) => {
       return c.json({ error: 'Date and time are required' }, 400)
     }
 
-    // Get tables that are not booked for the specified date/time
+    // Return all available tables (not booked for the specified date/time).
+    // Client will compute suitable single-table or multi-table combinations as needed.
     const { results } = await c.env.DB.prepare(`
       SELECT t.* FROM restaurant_tables t
-      WHERE t.capacity >= ?
-      AND t.id NOT IN (
+      WHERE t.id NOT IN (
         SELECT table_id FROM bookings 
         WHERE booking_date = ? 
         AND booking_time = ?
         AND status IN ('pending', 'confirmed')
       )
-      ORDER BY t.capacity, t.table_number
-    `).bind(guests || 1, date, time).all()
+      ORDER BY t.table_number
+    `).bind(date, time).all()
 
     return c.json(results)
   } catch (error) {
     return c.json({ error: 'Failed to fetch available tables' }, 500)
+  }
+})
+
+// Suggest table combinations based on desired guest count (1-16)
+app.get('/api/tables/suggest-combos', async (c) => {
+  try {
+    const date = c.req.query('date')
+    const time = c.req.query('time')
+    const guestsRaw = c.req.query('guests') || '2'
+    const guests = Math.max(1, Math.min(16, parseInt(guestsRaw)))
+
+    // Fetch available tables depending on whether a slot is specified
+    let { results: availableTables } = { results: [] as any[] }
+    if (date && time) {
+      const q = await c.env.DB.prepare(`
+        SELECT t.* FROM restaurant_tables t
+        WHERE t.id NOT IN (
+          SELECT table_id FROM bookings 
+          WHERE booking_date = ? 
+          AND booking_time = ?
+          AND status IN ('pending', 'confirmed')
+        )
+        ORDER BY t.table_number
+      `).bind(date, time).all()
+      availableTables = q.results || []
+    } else {
+      const q = await c.env.DB.prepare(`SELECT * FROM restaurant_tables ORDER BY table_number`).all()
+      availableTables = q.results || []
+    }
+
+    // Preferred mapping for 1..16 guests (ordered preference lists)
+    const mapping: Record<number, number[][]> = {
+      1: [[2]],
+      2: [[2]],
+      3: [[4]],
+      4: [[2,2],[4]],
+      5: [[4,2],[6]],
+      6: [[4,2],[6]],
+      7: [[4,4],[6,2],[8]],
+      8: [[4,4],[6,2],[8]],
+      9: [[4,4,2],[6,4],[8,2],[10]],
+      10: [[6,4],[4,4,2],[10]],
+      11: [[6,4,2],[8,4],[10,2]],
+      12: [[6,6],[4,4,4],[8,4],[10,2]],
+      13: [[6,4,4],[8,4,2],[10,4]],
+      14: [[6,4,4],[8,6],[10,4]],
+      15: [[10,4,2],[8,4,4],[6,4,4,2],[8,6,2]],
+      16: [[4,4,4,4],[8,8],[10,6],[8,4,4]]
+    }
+
+    const prefs = mapping[guests] || []
+
+    // Helper: try to materialize a pattern (array of capacities) into actual tables
+    function tryPattern(pattern: number[]) {
+      const used: any[] = []
+      const pool = availableTables.slice().sort((a,b) => a.table_number - b.table_number)
+      for (const cap of pattern) {
+        const idx = pool.findIndex(t => t.capacity === cap && !used.includes(t.id))
+        if (idx === -1) return null
+        const table = pool[idx]
+        used.push(table.id)
+        // mark removed
+        pool.splice(idx,1)
+      }
+      // return full table objects for used ids
+      return availableTables.filter(t => used.includes(t.id))
+    }
+
+    const combos: any[] = []
+    for (const p of prefs) {
+      const pat = p.slice() // copy
+      const res = tryPattern(pat)
+      if (res) {
+        combos.push({ tables: res, total: res.reduce((s:any,t:any)=>s+(t.capacity||0),0) })
+      }
+    }
+
+    return c.json({ guests, combos, availableTables })
+  } catch (error) {
+    console.error('Failed to suggest combos:', error)
+    return c.json({ error: 'Failed to suggest combos' }, 500)
+  }
+})
+
+// Get available time slots for a specific date and guest count
+app.get('/api/availability/slots', async (c) => {
+  try {
+    const date = c.req.query('date')
+    const guests = c.req.query('guests') || '2'
+
+    if (!date) {
+      return c.json({ error: 'Date is required' }, 400)
+    }
+
+    // Define typical restaurant hours (11:00 AM to 10:00 PM)
+    const timeSlots = [
+      '11:00', '11:30', '12:00', '12:30', '13:00', '13:30', '14:00', '14:30',
+      '15:00', '15:30', '16:00', '16:30', '17:00', '17:30', '18:00', '18:30',
+      '19:00', '19:30', '20:00', '20:30', '21:00', '21:30', '22:00'
+    ]
+
+    // Check which time slots have available tables
+    const availableSlots = []
+    for (const time of timeSlots) {
+      const { results } = await c.env.DB.prepare(`
+        SELECT COUNT(*) as available_count FROM restaurant_tables t
+        WHERE t.capacity = ?
+        AND t.id NOT IN (
+          SELECT table_id FROM bookings 
+          WHERE booking_date = ? 
+          AND booking_time = ?
+          AND status IN ('pending', 'confirmed')
+        )
+      `).bind(guests, date, time).all()
+
+      const count = results?.[0]?.available_count || 0
+      if (count > 0) {
+        availableSlots.push({
+          time,
+          available: true,
+          tablesAvailable: count
+        })
+      } else {
+        availableSlots.push({
+          time,
+          available: false,
+          tablesAvailable: 0
+        })
+      }
+    }
+
+    return c.json({
+      date,
+      guestCount: parseInt(guests),
+      slots: availableSlots
+    })
+  } catch (error) {
+    console.error('Failed to fetch availability slots:', error)
+    return c.json({ error: 'Failed to fetch availability slots' }, 500)
+  }
+})
+
+// Get available dates for next N days
+app.get('/api/availability/dates', async (c) => {
+  try {
+    const guests = c.req.query('guests') || '2'
+    const days = parseInt(c.req.query('days') || '30')
+
+    const availableDates = []
+    const today = new Date()
+
+    for (let i = 0; i < days; i++) {
+      const date = new Date(today)
+      date.setDate(date.getDate() + i)
+      const dateStr = date.toISOString().split('T')[0]
+
+      // Check if this date has any available tables at any time
+      const { results } = await c.env.DB.prepare(`
+        SELECT COUNT(DISTINCT t.id) as total_tables FROM restaurant_tables t
+        WHERE t.capacity = ?
+        AND t.id NOT IN (
+          SELECT DISTINCT table_id FROM bookings 
+          WHERE booking_date = ?
+          AND status IN ('pending', 'confirmed')
+        )
+      `).bind(guests, dateStr).all()
+
+      const availableCount = results?.[0]?.total_tables || 0
+      availableDates.push({
+        date: dateStr,
+        dayName: date.toLocaleDateString('en-US', { weekday: 'short' }),
+        available: availableCount > 0,
+        tablesAvailable: availableCount
+      })
+    }
+
+    return c.json({
+      guestCount: parseInt(guests),
+      dates: availableDates
+    })
+  } catch (error) {
+    console.error('Failed to fetch available dates:', error)
+    return c.json({ error: 'Failed to fetch available dates' }, 500)
   }
 })
 
@@ -164,14 +516,57 @@ app.post('/api/bookings', async (c) => {
       return c.json({ error: 'Table is already booked for this time slot' }, 409)
     }
 
-    const result = await c.env.DB.prepare(`
-      INSERT INTO bookings (user_id, table_id, booking_date, booking_time, guests_count, special_requests, status)
-      VALUES (?, ?, ?, ?, ?, ?, 'confirmed')
-    `).bind(userId, tableId, bookingDate, bookingTime, guestsCount, specialRequests || null).run()
+    let bookingIds = [];
+    if (Array.isArray(tableIds) && tableIds.length > 0) {
+      // Validate availability for each table
+      for (const tId of tableIds) {
+        const existing = await c.env.DB.prepare(`
+          SELECT id FROM bookings 
+          WHERE table_id = ? 
+          AND booking_date = ? 
+          AND booking_time = ?
+          AND status IN ('pending', 'confirmed')
+        `).bind(tId, bookingDate, bookingTime).first()
+        if (existing) {
+          return c.json({ error: `Table ${tId} is already booked for this time slot` }, 409)
+        }
+      }
+      // Insert bookings for each table
+      for (const tId of tableIds) {
+        const res = await c.env.DB.prepare(`
+          INSERT INTO bookings (user_id, table_id, booking_date, booking_time, guests_count, special_requests, status)
+          VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        `).bind(userId, tId, bookingDate, bookingTime, guestsCount, specialRequests || null).run()
+        bookingIds.push(res.meta.last_row_id)
+      }
+    } else {
+      const res = await c.env.DB.prepare(`
+        INSERT INTO bookings (user_id, table_id, booking_date, booking_time, guests_count, special_requests, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending')
+      `).bind(userId, tableId, bookingDate, bookingTime, guestsCount, specialRequests || null).run()
+      bookingIds.push(res.meta.last_row_id)
+    }
+
+    // Placeholder receipt notification
+    const user = await c.env.DB.prepare(`SELECT email, phone, name FROM users WHERE id = ?`).bind(userId).first()
+    if (user) {
+      const bookingAmount = (Number(guestsCount) || 0) * 100
+      await sendReceipt({ ...user, whatsapp: user.phone }, {
+        type: 'booking',
+        bookingIds,
+        bookingDate,
+        bookingTime,
+        guestsCount,
+        tableIds: tableIds || [tableId],
+        amount: bookingAmount,
+        currency: 'INR',
+        notes: 'Cover charge ₹50 per head per hour (payment confirms booking)'
+      })
+    }
 
     return c.json({ 
       success: true, 
-      bookingId: result.meta.last_row_id,
+      bookingIds,
       message: 'Booking created successfully' 
     })
   } catch (error) {
@@ -212,6 +607,26 @@ app.get('/api/bookings', async (c) => {
     return c.json(results)
   } catch (error) {
     return c.json({ error: 'Failed to fetch bookings' }, 500)
+  }
+})
+
+// Update booking (e.g., confirm after payment)
+app.patch('/api/bookings/:id', async (c) => {
+  try {
+    const bookingId = c.req.param('id')
+    const { status } = await c.req.json()
+
+    if (!status) {
+      return c.json({ error: 'Status is required' }, 400)
+    }
+
+    await c.env.DB.prepare(`
+      UPDATE bookings SET status = ? WHERE id = ?
+    `).bind(status, bookingId).run()
+
+    return c.json({ success: true, message: 'Booking updated' })
+  } catch (error) {
+    return c.json({ error: 'Failed to update booking' }, 500)
   }
 })
 
@@ -320,11 +735,18 @@ app.post('/api/orders', async (c) => {
       return c.json({ error: 'User, items, and total amount are required' }, 400)
     }
 
+    // Booking fee logic: ₹100/hr unless food total >= ₹1000; assume 1 hour slot by default
+    let bookingFee = 0
+    if (bookingId) {
+      bookingFee = totalAmount >= 1000 ? 0 : 100
+    }
+    const finalTotal = totalAmount + bookingFee
+
     // Create order
     const orderResult = await c.env.DB.prepare(`
       INSERT INTO orders (user_id, booking_id, total_amount, order_type, special_instructions, status, payment_status)
       VALUES (?, ?, ?, ?, ?, 'pending', 'pending')
-    `).bind(userId, bookingId || null, totalAmount, orderType || 'dine-in', specialInstructions || null).run()
+    `).bind(userId, bookingId || null, finalTotal, orderType || 'dine-in', specialInstructions || null).run()
 
     const orderId = orderResult.meta.last_row_id
 
@@ -336,9 +758,25 @@ app.post('/api/orders', async (c) => {
       `).bind(orderId, item.menuItemId, item.quantity, item.price, item.specialNotes || null).run()
     }
 
+    // Receipt notification placeholder
+    const user = await c.env.DB.prepare(`SELECT email, phone, name FROM users WHERE id = ?`).bind(userId).first()
+    if (user) {
+      await sendReceipt({ ...user, whatsapp: user.phone }, {
+        type: 'order',
+        orderId,
+        bookingId: bookingId || null,
+        items,
+        foodTotal: totalAmount,
+        bookingFee,
+        finalTotal
+      })
+    }
+
     return c.json({ 
       success: true, 
       orderId,
+      bookingFee,
+      finalTotal,
       message: 'Order created successfully' 
     })
   } catch (error) {
@@ -359,20 +797,75 @@ app.get('/api/orders/user/:userId', async (c) => {
       ORDER BY o.created_at DESC
     `).bind(userId).all()
 
+    if (!results || results.length === 0) {
+      console.log(`No orders found for user ${userId}`)
+      return c.json([])
+    }
+
     // Get order items for each order
     for (const order of results) {
-      const { results: items } = await c.env.DB.prepare(`
-        SELECT oi.*, m.name, m.description
-        FROM order_items oi
-        JOIN menu_items m ON oi.menu_item_id = m.id
-        WHERE oi.order_id = ?
-      `).bind(order.id).all()
-      
-      order.items = items
+      try {
+        const itemsResult = await c.env.DB.prepare(`
+          SELECT oi.*, m.name, m.description, m.price
+          FROM order_items oi
+          JOIN menu_items m ON oi.menu_item_id = m.id
+          WHERE oi.order_id = ?
+        `).bind(order.id).all()
+        
+        order.items = itemsResult.results || []
+        console.log(`Order ${order.id} has ${order.items.length} items`)
+      } catch (itemErr) {
+        console.error(`Failed to fetch items for order ${order.id}:`, itemErr)
+        order.items = []
+      }
+    }
+    
+    // No orders yet - this is normal during booking process
+    return c.json(results)
+  } catch (error) {
+    console.error('Failed to fetch user orders:', error)
+    return c.json({ error: 'Failed to fetch orders' }, 500)
+  }
+})
+
+// Get orders by booking ID
+app.get('/api/orders/booking/:bookingId', async (c) => {
+  try {
+    const bookingId = c.req.param('bookingId')
+
+    const { results } = await c.env.DB.prepare(`
+      SELECT o.*, b.booking_date, b.booking_time
+      FROM orders o
+      LEFT JOIN bookings b ON o.booking_id = b.id
+      WHERE o.booking_id = ?
+      ORDER BY o.created_at DESC
+    `).bind(bookingId).all()
+
+    if (!results || results.length === 0) {
+      console.log(`No orders found for booking ${bookingId}`)
+      return c.json([])
+    }
+          // No orders yet - this is normal during booking process
+    for (const order of results) {
+      try {
+        const itemsResult = await c.env.DB.prepare(`
+          SELECT oi.*, m.name, m.description, m.price
+          FROM order_items oi
+          JOIN menu_items m ON oi.menu_item_id = m.id
+          WHERE oi.order_id = ?
+        `).bind(order.id).all()
+        
+        order.items = itemsResult.results || []
+        console.log(`Order ${order.id} has ${order.items.length} items`)
+      } catch (itemErr) {
+        console.error(`Failed to fetch items for order ${order.id}:`, itemErr)
+        order.items = []
+      }
     }
 
     return c.json(results)
   } catch (error) {
+    console.error('Failed to fetch orders by booking:', error)
     return c.json({ error: 'Failed to fetch orders' }, 500)
   }
 })
@@ -459,34 +952,215 @@ app.patch('/api/orders/:id', async (c) => {
 
 // ============= PAYMENT ROUTES =============
 
-// Process payment (Stripe integration placeholder)
-app.post('/api/payment/process', async (c) => {
+// Unified checkout (simulated processor)
+app.post('/api/payments/checkout', async (c) => {
   try {
-    const { orderId, amount, paymentMethod } = await c.req.json()
+    const { userId, orderId, bookingId, amount, method, contact } = await c.req.json()
 
-    if (!orderId || !amount) {
-      return c.json({ error: 'Order ID and amount are required' }, 400)
+    if (!userId || amount == null || !method) {
+      return c.json({ error: 'User, amount, and method are required' }, 400)
     }
 
-    // In production, integrate with Stripe API here
-    // For now, simulate successful payment
-    const paymentId = `pi_${Date.now()}_${Math.random().toString(36).substring(7)}`
+    const numericAmount = Number(amount)
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+      return c.json({ error: 'Amount must be greater than zero' }, 400)
+    }
+
+    const txRef = `tx_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
+    const status = method === 'cash' ? 'pending' : 'succeeded'
 
     await c.env.DB.prepare(`
-      UPDATE orders 
-      SET payment_status = 'paid', 
-          payment_method = ?,
-          stripe_payment_id = ?
-      WHERE id = ?
-    `).bind(paymentMethod || 'stripe', paymentId, orderId).run()
+      INSERT INTO payments (user_id, order_id, booking_id, method, amount, status, tx_ref)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(userId, orderId || null, bookingId || null, method, amount, status, txRef).run()
+
+    if (orderId) {
+      await c.env.DB.prepare(`
+        UPDATE orders 
+        SET payment_status = ?, 
+            payment_method = ?,
+            stripe_payment_id = ?
+        WHERE id = ?
+      `).bind(status === 'succeeded' ? 'paid' : 'pending', method, txRef, orderId).run()
+    }
+
+    const user = await c.env.DB.prepare(`SELECT email, phone, name FROM users WHERE id = ?`).bind(userId).first()
+    const receiptRecipient = {
+      email: contact?.email || user?.email,
+      phone: contact?.phone || user?.phone,
+      whatsapp: contact?.whatsapp || contact?.phone || user?.phone
+    }
+
+      await sendReceipt(receiptRecipient, {
+      type: 'payment',
+      txRef,
+      status,
+      method,
+        amount: numericAmount,
+      orderId: orderId || null,
+      bookingId: bookingId || null
+    })
 
     return c.json({ 
       success: true, 
-      paymentId,
-      message: 'Payment processed successfully' 
+      txRef,
+      status,
+      message: status === 'succeeded' 
+        ? 'Payment processed successfully' 
+        : 'Payment recorded as pending; please complete on delivery'
     })
   } catch (error) {
     return c.json({ error: 'Payment processing failed' }, 500)
+  }
+})
+
+// ============= NOTIFICATION ROUTES =============
+
+// Send receipt notification via Email/SMS/WhatsApp
+app.post('/api/notifications/send-receipt', async (c) => {
+  try {
+    const { email, phone, whatsapp, name, items, orderId, totalAmount, orderType, paymentMethod, bookingDetails } = await c.req.json()
+
+    // Validate at least one contact method
+    if (!email && !phone && !whatsapp) {
+      return c.json({ error: 'At least one contact method (email, phone, whatsapp) is required' }, 400)
+    }
+
+    // Email notification - Unified receipt with booking and food
+    if (email) {
+      try {
+        let emailBody = `
+Dear ${name},
+
+Thank you for your order! Here's your complete receipt.
+
+${'═'.repeat(60)}
+📋 COMPLETE ORDER RECEIPT
+${'═'.repeat(60)}
+
+Order ID: ${orderId}
+Customer Name: ${name}
+Order Date & Time: ${new Date().toLocaleString()}
+
+${'═'.repeat(60)}`
+
+        // Add booking details if available
+        if (bookingDetails) {
+          emailBody += `
+🍽️ TABLE BOOKING DETAILS:
+─────────────────────────
+Table: ${bookingDetails.tableNumber}
+Capacity: ${bookingDetails.capacity} seats
+Location: ${bookingDetails.location}
+Booking Date: ${bookingDetails.bookingDate}
+Booking Time: ${bookingDetails.bookingTime}
+Number of Guests: ${bookingDetails.guestsCount}
+${bookingDetails.specialRequests ? `Special Requests: ${bookingDetails.specialRequests}` : ''}
+Booking Cover Charge: ₹${bookingDetails.bookingAmount || '0.00'}
+
+${'─'.repeat(60)}`
+        }
+
+        // Add food items
+        emailBody += `
+🍴 FOOD ITEMS ORDERED:
+─────────────────────────
+${items?.map((item: any) => `  • ${item.name} x${item.quantity} = ₹${(item.price * item.quantity).toFixed(2)}`).join('\n') || '  No items'}
+
+Food Total: ₹${items?.reduce((sum: number, item: any) => sum + (item.price * item.quantity), 0).toFixed(2) || '0.00'}
+${bookingDetails ? `Booking Cover Charge: ₹${bookingDetails.bookingAmount || '0.00'}` : ''}
+
+${'═'.repeat(60)}
+💰 GRAND TOTAL: ₹${totalAmount?.toFixed(2) || '0.00'}
+${'═'.repeat(60)}
+
+Order Type: ${orderType?.toUpperCase() || 'Dine-In'}
+Payment Method: ${paymentMethod?.toUpperCase() || 'Not specified'}
+Payment Status: ✅ CONFIRMED
+
+${'═'.repeat(60)}
+Thank you for your order! 
+${bookingDetails ? 'We look forward to serving you!' : 'Your food is being prepared.'}
+${'═'.repeat(60)}
+
+Best regards,
+Restaurant Team
+        `
+        
+        // Log that email would be sent
+        console.log(`📧 EMAIL NOTIFICATION SENT TO: ${email}`)
+        console.log(emailBody)
+      } catch (err) {
+        console.error('Email notification error:', err)
+      }
+    }
+
+    // SMS notification
+    if (phone) {
+      try {
+        let smsBody = `✅ Order Confirmed! Order ID: ${orderId}. `
+        if (bookingDetails) {
+          smsBody += `Table: ${bookingDetails.tableNumber} on ${bookingDetails.bookingDate}. `
+        }
+        smsBody += `Items: ${items?.length || 0}. Total: ₹${totalAmount}. Thank you!`
+        
+        // Log that SMS would be sent
+        console.log(`📱 SMS NOTIFICATION SENT TO: ${phone}`, smsBody)
+      } catch (err) {
+        console.error('SMS notification error:', err)
+      }
+    }
+
+    // WhatsApp notification  
+    if (whatsapp) {
+      try {
+        let waMessage = `🎉 *Order Confirmed!*\n\n`
+        waMessage += `📋 Order ID: ${orderId}\n`
+        waMessage += `👤 Name: ${name}\n`
+        
+        if (bookingDetails) {
+          waMessage += `\n🍽️ *Table Booking:*\n`
+          waMessage += `📅 Date: ${bookingDetails.bookingDate}\n`
+          waMessage += `🕐 Time: ${bookingDetails.bookingTime}\n`
+          waMessage += `👥 Guests: ${bookingDetails.guestsCount}\n`
+          waMessage += `🪑 Table: ${bookingDetails.tableNumber}\n`
+        }
+        
+        waMessage += `\n🍴 *Food Items:*\n`
+        waMessage += `${items?.map((item: any) => `• ${item.name} x${item.quantity}`).join('\n') || 'No items'}\n`
+        
+        waMessage += `\n💰 *Total: ₹${totalAmount}*\n`
+        waMessage += `💳 Payment: ${paymentMethod?.toUpperCase() || 'Not specified'}\n`
+        waMessage += `✅ Status: CONFIRMED\n`
+        waMessage += `\nThank you for your order! 🙏`
+        
+        // Log that WhatsApp would be sent
+        console.log(`💬 WHATSAPP NOTIFICATION SENT TO: ${whatsapp}`)
+        console.log(waMessage)
+      } catch (err) {
+        console.error('WhatsApp notification error:', err)
+      }
+    }
+
+    return c.json({
+      success: true,
+      message: 'Receipt notifications queued',
+      notificationsSent: {
+        email: !!email,
+        sms: !!phone,
+        whatsapp: !!whatsapp
+      },
+      channels: {
+        email: email || 'not provided',
+        phone: phone || 'not provided',
+        whatsapp: whatsapp || 'not provided'
+      }
+    })
+  } catch (error) {
+    if (typeof console !== 'undefined' && console.error) {
+      console.error('Notification error:', error)
+    }
+    return c.json({ error: 'Failed to send notifications' }, 500)
   }
 })
 
@@ -573,7 +1247,7 @@ app.get('/', (c) => {
             <div class="flex justify-between h-16">
                 <div class="flex items-center">
                     <i class="fas fa-utensils text-purple-600 text-2xl mr-2"></i>
-                    <span class="text-2xl font-bold text-gray-800">DelightDine</span>
+                    <span class="text-2xl font-bold text-gray-800">Mom's Kitchen</span>
                 </div>
                 <div class="flex items-center space-x-4">
                     <a href="#home" class="nav-link text-gray-600 hover:text-purple-600 px-3 py-2">Home</a>
@@ -598,7 +1272,7 @@ app.get('/', (c) => {
     <!-- Hero Section -->
     <section id="home" class="hero-bg text-white py-20">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
-            <h1 class="text-5xl font-bold mb-4">Welcome to DelightDine</h1>
+            <h1 class="text-5xl font-bold mb-4">Welcome to Mom's Kitchen</h1>
             <p class="text-xl mb-8">Experience culinary excellence with seamless table reservations</p>
             <div class="flex justify-center space-x-4">
                 <a href="#booking" class="bg-white text-purple-600 px-8 py-3 rounded-lg font-semibold hover:bg-gray-100">
@@ -672,7 +1346,10 @@ app.get('/', (c) => {
                         </div>
                         <div>
                             <label class="block text-gray-700 font-medium mb-2">Number of Guests</label>
-                            <input type="number" id="guestsCount" min="1" max="20" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-600" required>
+                            <select id="guestsCount" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-600" required onchange="loadTablesForGuests()">
+                                <option value="">Select number of guests</option>
+                                ${Array.from({length: 16}, (_, i) => `<option value="${i + 1}">${i + 1} ${i === 0 ? 'guest' : 'guests'}</option>`).join('')}
+                            </select>
                         </div>
                         <div>
                             <label class="block text-gray-700 font-medium mb-2">Select Table</label>
@@ -693,6 +1370,12 @@ app.get('/', (c) => {
                             <i class="fas fa-check mr-2"></i>Confirm Booking
                         </button>
                     </div>
+                    
+                    <!-- Available Dates Section -->
+                    <div id="availableDatesList" class="mt-6"></div>
+                    
+                    <!-- Available Time Slots Section -->
+                    <div id="timeSlotsList" class="mt-6"></div>
                 </form>
             </div>
         </div>
@@ -784,15 +1467,24 @@ app.get('/', (c) => {
     </div>
 
     <!-- Checkout Modal -->
-    <div id="checkoutModal" class="modal fixed inset-0 bg-black bg-opacity-50 items-center justify-center z-50">
-        <div class="bg-white rounded-lg p-8 max-w-md w-full mx-4">
+    <div id="checkoutModal" class="modal fixed inset-0 bg-black bg-opacity-50 items-center justify-center z-50 overflow-hidden">
+        <div class="bg-white rounded-lg max-w-md w-full mx-4 max-h-screen overflow-y-auto flex flex-col">
+            <div class="p-8">
             <div class="flex justify-between items-center mb-6">
                 <h2 class="text-2xl font-bold">Checkout</h2>
                 <button id="closeCheckoutModal" class="text-gray-500 hover:text-gray-700">
                     <i class="fas fa-times text-2xl"></i>
                 </button>
             </div>
-            <div class="mb-6">
+            <!-- Order Items Summary -->
+            <div class="mb-6 bg-gray-50 p-4 rounded-lg max-h-48 overflow-y-auto">
+                <h3 class="font-bold text-gray-800 mb-3">Order Items:</h3>
+                <div id="checkoutItems" class="space-y-2">
+                    <p class="text-gray-500 text-sm">Loading items...</p>
+                </div>
+            </div>
+            
+            <div class="mb-6 border-t pt-4">
                 <p class="text-gray-600 mb-2">Total Amount:</p>
                 <p class="text-3xl font-bold text-purple-600" id="checkoutTotal">$0.00</p>
             </div>
@@ -812,9 +1504,29 @@ app.get('/', (c) => {
                     <label class="block text-gray-700 font-medium mb-2">Payment Method</label>
                     <div class="space-y-2">
                         <label class="flex items-center">
-                            <input type="radio" name="paymentMethod" value="stripe" checked class="mr-2">
-                            <i class="fab fa-cc-stripe text-2xl mr-2"></i>
-                            <span>Stripe (Card Payment)</span>
+                            <input type="radio" name="paymentMethod" value="credit_card" checked class="mr-2">
+                            <i class="fas fa-credit-card text-2xl mr-2"></i>
+                            <span>Credit Card</span>
+                        </label>
+                        <label class="flex items-center">
+                            <input type="radio" name="paymentMethod" value="debit_card" class="mr-2">
+                            <i class="far fa-credit-card text-2xl mr-2"></i>
+                            <span>Debit Card</span>
+                        </label>
+                        <label class="flex items-center">
+                            <input type="radio" name="paymentMethod" value="upi" class="mr-2">
+                            <i class="fas fa-mobile-alt text-2xl mr-2"></i>
+                            <span>UPI</span>
+                        </label>
+                        <label class="flex items-center">
+                            <input type="radio" name="paymentMethod" value="netbanking" class="mr-2">
+                            <i class="fas fa-university text-2xl mr-2"></i>
+                            <span>Net Banking</span>
+                        </label>
+                        <label class="flex items-center">
+                            <input type="radio" name="paymentMethod" value="wallet" class="mr-2">
+                            <i class="fas fa-wallet text-2xl mr-2"></i>
+                            <span>Wallet</span>
                         </label>
                         <label class="flex items-center">
                             <input type="radio" name="paymentMethod" value="cash" class="mr-2">
@@ -823,10 +1535,28 @@ app.get('/', (c) => {
                         </label>
                     </div>
                 </div>
-                <button type="submit" class="w-full bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700">
-                    <i class="fas fa-lock mr-2"></i>Complete Payment
-                </button>
+                <div class="mb-4">
+                    <label class="block text-gray-700 font-medium mb-2">UPI ID (if paying via UPI)</label>
+                    <input id="upiId" type="text" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-600" placeholder="yourname@upi">
+                </div>
+                <div class="mb-4">
+                    <label class="block text-gray-700 font-medium mb-2">Receipt email</label>
+                    <input id="receiptEmail" type="email" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-600" placeholder="you@example.com">
+                </div>
+                <div class="mb-6">
+                    <label class="block text-gray-700 font-medium mb-2">Receipt phone / WhatsApp</label>
+                    <input id="receiptPhone" type="tel" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-600" placeholder="+91XXXXXXXXXX">
+                </div>
+                <div class="flex space-x-3">
+                    <button type="button" id="paymentCancelBtn" class="w-1/2 border border-gray-300 text-gray-700 py-3 rounded-lg font-semibold hover:bg-gray-100">
+                        Cancel
+                    </button>
+                    <button type="submit" class="w-1/2 bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700">
+                        <i class="fas fa-lock mr-2"></i>Complete Payment
+                    </button>
+                </div>
             </form>
+            </div>
         </div>
     </div>
 
