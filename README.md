@@ -1,12 +1,6 @@
 # 🍽️Restaurant Reservation & Dining App
 
 A full-featured restaurant reservation and dining application built with Hono framework and Cloudflare D1 database.
-
-## 🌐 Live URLs
-
-- **Sandbox Development**: https://3000-imwaiosoccqqq5i6ht2kp-ad490db5.sandbox.novita.ai
-- **Production**: (Deploy using `npm run deploy:prod`)
-
 ## ✨ Currently Completed Features
 
 ### ✅ User Authentication
@@ -320,7 +314,7 @@ npm run deploy:prod
 
 - **Platform**: Cloudflare Pages
 - **Status**: ✅ Active (Development)
-- **Last Updated**: 2025-12-11
+- **Last Updated**: 2025-12-12
 
 ## 🎨 Color Theme
 
@@ -337,7 +331,5 @@ MIT License - Feel free to use for your restaurant!
 
 ---
 
-**Built with ❤️ using Hono + Cloudflare Edge Platform**
-#   R e s t a u r a n t - R e s e r v a t i o n - a n d - D i n i n g - A p p 
  
  
