@@ -1,4 +1,4 @@
-# 🍽️ DelightDine - Restaurant Reservation & Dining App
+# 🍽️Restaurant Reservation & Dining App
 
 A full-featured restaurant reservation and dining application built with Hono framework and Cloudflare D1 database.
 
@@ -338,5 +338,6 @@ MIT License - Feel free to use for your restaurant!
 ---
 
 **Built with ❤️ using Hono + Cloudflare Edge Platform**
-#   R e s t a u r a n t - R e s e r v a t i o n - a n d - D i n i n g - A p p  
+#   R e s t a u r a n t - R e s e r v a t i o n - a n d - D i n i n g - A p p 
+ 
  
